@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 from functools import partial
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 import websockets
@@ -269,7 +269,9 @@ class QuietHandler(SimpleHTTPRequestHandler):
 
 def serve_static(port):
     handler = partial(QuietHandler, directory=str(DIST_DIR))
-    HTTPServer(("127.0.0.1", port), handler).serve_forever()
+    # ThreadingHTTPServer: a browser holding a keep-alive connection must
+    # not block every other client (HTTPServer is single-threaded)
+    ThreadingHTTPServer(("127.0.0.1", port), handler).serve_forever()
 
 
 # --------------------------------------------------------------------------
