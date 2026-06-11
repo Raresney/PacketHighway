@@ -1,8 +1,8 @@
-"""PacketHighway - live network traffic visualizer.
+"""PacketHighway - live network traffic visualization platform.
 
 Captures packets with scapy (or generates synthetic traffic in demo mode)
-and streams compact packet summaries over a WebSocket to a browser page
-that renders each packet as a vehicle on a divided highway.
+and streams compact packet summaries over a WebSocket to a 3D dashboard
+(React Three Fiber) where every packet drives down a virtual highway.
 
 Usage:
     python packet_highway.py --demo          # synthetic traffic, no Npcap needed
@@ -25,18 +25,24 @@ from pathlib import Path
 
 import websockets
 
-STATIC_DIR = Path(__file__).parent / "static"
+DIST_DIR = Path(__file__).parent / "dist"
 
 # Sampling cap: above this many packets per batch the browser only gets a
-# random sample to draw as cars, but the batch totals stay accurate.
-MAX_CARS_PER_BATCH = 80
+# random sample to spawn as vehicles, but the batch totals stay accurate.
+MAX_CARS_PER_BATCH = 100
 BATCH_INTERVAL = 0.06  # seconds
 QUEUE_LIMIT = 5000
+
+SUSPICIOUS_PORTS = {23, 445, 1337, 3389, 4444, 5900, 6667, 31337}
+ENCRYPTED_PORTS = {22, 443, 853, 993, 995, 8443}
 
 clients = set()
 queue: asyncio.Queue = None
 loop: asyncio.AbstractEventLoop = None
 capture_mode = "demo"
+
+# demo attack simulation state, toggled from the dashboard
+ATTACK = {"until": 0.0, "src": None}
 
 
 # --------------------------------------------------------------------------
@@ -53,6 +59,12 @@ def port_proto(sport, dport, fallback):
         if port == 53:
             return "DNS"
     return fallback
+
+
+def flag_ports(sport, dport):
+    sus = 1 if sport in SUSPICIOUS_PORTS or dport in SUSPICIOUS_PORTS else 0
+    enc = 1 if sport in ENCRYPTED_PORTS or dport in ENCRYPTED_PORTS else 0
+    return sus, enc
 
 
 def local_ips():
@@ -100,8 +112,10 @@ def live_source(push, iface):
                 proto = port_proto(sp, dp, "UDP")
             elif pkt.haslayer(ICMP):
                 proto = "ICMP"
+        sus, enc = flag_ports(sp, dp)
         push({"p": proto, "s": src, "d": dst, "sp": sp, "dp": dp,
-              "b": size, "o": 1 if src in lips else 0})
+              "b": size, "o": 1 if src in lips else 0,
+              "t": int(time.time() * 1000), "x": sus, "e": enc})
 
     try:
         sniff(prn=on_packet, store=False, iface=iface)
@@ -123,6 +137,8 @@ def demo_packet(me):
     outbound = random.random() < 0.45
     peer = ".".join(str(random.randint(1, 254)) for _ in range(4))
     sp, dp = random.randint(49152, 65535), 0
+    latency = random.randint(2, 40) if random.random() < 0.8 \
+        else random.randint(40, 130)
 
     if proto == "DNS":
         peer = random.choice(["1.1.1.1", "8.8.8.8", "9.9.9.9"])
@@ -136,7 +152,7 @@ def demo_packet(me):
             size = (random.randint(1000, 1514) if random.random() < 0.6
                     else random.randint(100, 900))
     elif proto == "TCP":
-        dp = random.choice([22, 8080, 3389, random.randint(1024, 65535)])
+        dp = random.choice([22, 8080, 5000, random.randint(1024, 65535)])
         size = random.choice([random.randint(60, 200),
                               random.randint(200, 1514)])
     elif proto == "UDP":
@@ -149,17 +165,40 @@ def demo_packet(me):
         sp = dp = 0
         size = random.randint(42, 600)
 
+    # the occasional probe against a sensitive port
+    if random.random() < 0.005 and proto in ("TCP", "OTHER"):
+        dp = random.choice(sorted(SUSPICIOUS_PORTS))
+        size = random.randint(40, 120)
+
+    sus, enc = flag_ports(sp, dp)
+    base = {"p": proto, "b": size, "t": int(time.time() * 1000),
+            "l": latency, "x": sus, "e": enc}
     if outbound:
-        return {"p": proto, "s": me, "d": peer, "sp": sp, "dp": dp,
-                "b": size, "o": 1}
-    return {"p": proto, "s": peer, "d": me, "sp": dp, "dp": sp,
-            "b": size, "o": 0}
+        return {**base, "s": me, "d": peer, "sp": sp, "dp": dp, "o": 1}
+    return {**base, "s": peer, "d": me, "sp": dp, "dp": sp, "o": 0}
+
+
+def attack_packet(me):
+    """One packet of the simulated DDoS flood."""
+    return {
+        "p": "TCP", "s": ATTACK["src"], "d": me,
+        "sp": random.randint(1024, 65535),
+        "dp": random.choice([445, 23, 4444]),
+        "b": random.randint(40, 120), "o": 0,
+        "t": int(time.time() * 1000),
+        "l": random.randint(80, 200), "x": 1, "e": 0,
+    }
 
 
 def demo_source(push):
     """Generate a realistic-looking synthetic traffic stream."""
     me = "192.168.1.34"
     while True:
+        if time.time() < ATTACK["until"]:
+            time.sleep(0.012)
+            for _ in range(random.randint(2, 5)):
+                push(attack_packet(me))
+            continue
         time.sleep(random.expovariate(16))
         # occasional burst, like a page load pulling in resources
         burst = random.randint(4, 18) if random.random() < 0.06 else 1
@@ -187,7 +226,15 @@ async def ws_handler(websocket):
     try:
         await websocket.send(json.dumps({"type": "hello",
                                          "mode": capture_mode}))
-        await websocket.wait_closed()
+        async for message in websocket:
+            try:
+                msg = json.loads(message)
+            except ValueError:
+                continue
+            if msg.get("cmd") == "attack" and capture_mode == "demo":
+                ATTACK["src"] = ".".join(
+                    str(random.randint(1, 254)) for _ in range(4))
+                ATTACK["until"] = time.time() + 8
     finally:
         clients.discard(websocket)
 
@@ -212,7 +259,7 @@ async def broadcaster():
 
 
 # --------------------------------------------------------------------------
-# HTTP server for the frontend
+# HTTP server for the built frontend
 # --------------------------------------------------------------------------
 
 class QuietHandler(SimpleHTTPRequestHandler):
@@ -221,7 +268,7 @@ class QuietHandler(SimpleHTTPRequestHandler):
 
 
 def serve_static(port):
-    handler = partial(QuietHandler, directory=str(STATIC_DIR))
+    handler = partial(QuietHandler, directory=str(DIST_DIR))
     HTTPServer(("127.0.0.1", port), handler).serve_forever()
 
 
@@ -231,6 +278,10 @@ async def main(args):
     global queue, loop
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
+
+    if not DIST_DIR.exists():
+        print("[!] dist/ not found - build the frontend first:")
+        print("        npm install && npm run build")
 
     threading.Thread(target=serve_static, args=(args.port,),
                      daemon=True).start()
